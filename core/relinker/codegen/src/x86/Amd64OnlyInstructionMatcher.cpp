@@ -28,6 +28,7 @@
 #include <codegen/x86/Avx2TwinLowering.hpp>
 #include <codegen/x86/LaneSplitLowering.hpp>
 #include <codegen/x86/F16cLowering.hpp>
+#include <codegen/x86/FmaLowering.hpp>
 #include <codegen/x86/PermuteLowering.hpp>
 #include <codegen/x86/WidenBroadcastLowering.hpp>
 #include <codegen/CodegenException.hpp>
@@ -327,6 +328,10 @@ const char* Amd64OnlyInstructionMatcher::_emitOutOfLine(StubBodyBuilder& body, c
         EmitFloatToHalf(body, *half);
         return "VCVTPS2PH";
     }
+    if (const auto fused = _target == Amd64OnlyTarget::Avx ? DecodeFma(instr.Data, instr.Length) : std::nullopt) {
+        EmitFma(body, *fused);
+        return fused->Name;
+    }
     if (const auto permute = _target == Amd64OnlyTarget::Avx ? DecodePermute(instr.Data, instr.Length) : std::nullopt) {
         EmitPermute(body, *permute);
         return permute->Name;
@@ -541,6 +546,9 @@ std::optional<Amd64OnlyMatch> Amd64OnlyInstructionMatcher::Match(
 
     if (const auto half = _target == Amd64OnlyTarget::Avx ? DecodeFloatToHalf(data, length) : std::nullopt)
         return _trampoline("VCVTPS2PH", length, _outOfLine(length, trailing, [&](StubBodyBuilder& body) { EmitFloatToHalf(body, *half); }), false, true);
+
+    if (const auto fused = _target == Amd64OnlyTarget::Avx ? DecodeFma(data, length) : std::nullopt)
+        return _trampoline(fused->Name, length, _outOfLine(length, trailing, [&](StubBodyBuilder& body) { EmitFma(body, *fused); }), false, true);
 
     if (const auto permute = _target == Amd64OnlyTarget::Avx ? DecodePermute(data, length) : std::nullopt)
         return _trampoline(permute->Name, length, _outOfLine(length, trailing, [&](StubBodyBuilder& body) { EmitPermute(body, *permute); }), false, true);
