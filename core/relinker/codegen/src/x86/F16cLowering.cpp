@@ -1,6 +1,7 @@
 #include <codegen/x86/F16cLowering.hpp>
 #include <codegen/x86/VexEncoding.hpp>
 #include <array>
+#include <string>
 #include <vector>
 
 namespace Codegen {
@@ -11,6 +12,7 @@ using namespace VexEncoding;
 namespace {
 
 constexpr const char* kHalfToFloatName = "VCVTPH2PS";
+constexpr const char* kFloatToHalfName = "VCVTPS2PH";
 constexpr std::int32_t kRedZone = 128;
 constexpr std::int32_t kControlSlot = 16;
 constexpr std::uint8_t kNoPrefix = 0;
@@ -32,6 +34,21 @@ constexpr Form kLoadQword{Map0F, PrefixF3, false, false, 0x7E};
 constexpr Form kLoadDword{Map0F, Prefix66, false, false, 0x6E};
 constexpr Form kStoreDword{Map0F, Prefix66, false, false, 0x7E};
 constexpr Form kControl{Map0F, kNoPrefix, false, false, 0xAE};
+constexpr Form kLoadVector{Map0F, PrefixF3, false, false, 0x6F};
+constexpr Form kStoreVector{Map0F, PrefixF3, false, false, 0x7F};
+constexpr Form kStoreQword{Map0F, Prefix66, false, false, 0xD6};
+constexpr Form kAddFloats{Map0F, kNoPrefix, false, false, 0x58};
+constexpr Form kSubtractFloats{Map0F, kNoPrefix, false, false, 0x5C};
+constexpr Form kCompareFloats{Map0F, kNoPrefix, false, false, 0xC2};
+constexpr Form kPackDwords{Map0F38, Prefix66, false, false, 0x2B};
+constexpr std::uint8_t kShiftRight = 2;
+constexpr std::uint8_t kShiftArithmetic = 4;
+constexpr std::uint8_t kNotEqualOrdered = 0x0C;
+constexpr std::uint32_t kDenormalFlag = 2;
+constexpr std::uint32_t kOverflowFlag = 8;
+constexpr std::uint32_t kUnderflowFlag = 0x10;
+constexpr std::uint32_t kPrecisionFlag = 0x20;
+constexpr std::size_t kFloatToHalfScratch = 12;
 constexpr std::uint8_t kShiftLeft = 6;
 constexpr std::uint8_t kShiftBytesRight = 3;
 constexpr std::uint8_t kLoadControl = 2;
@@ -85,17 +102,182 @@ void _halfsToFloats(StubBodyBuilder& body, const Registers& r, const std::uint8_
     Register(body, kOr, destination, r.Result, r.Sign);
 }
 
+void _orReduce(StubBodyBuilder& body, const std::uint8_t flags, const std::uint8_t temporary) {
+    Register(body, kShuffleDwords, temporary, 0, flags, std::uint8_t{0x4E});
+    Register(body, kOr, flags, flags, temporary);
+    Register(body, kShuffleDwords, temporary, 0, flags, std::uint8_t{0xB1});
+    Register(body, kOr, flags, flags, temporary);
+}
+
+void _raiseFlags(StubBodyBuilder& body, const std::uint8_t flags, const std::uint8_t temporary, const std::int32_t saved, const std::int32_t work) {
+    VexEncoding::StackOperand(body, kLoadDword, temporary, 0, saved);
+    Register(body, kOr, temporary, temporary, flags);
+    VexEncoding::StackOperand(body, kStoreDword, temporary, 0, work);
+    VexEncoding::StackOperand(body, kControl, kLoadControl, 0, work);
+}
+
 void _raiseInvalid(StubBodyBuilder& body, const Registers& r, const std::int32_t control) {
-    Register(body, kShuffleDwords, r.Temporary, 0, r.Invalid, std::uint8_t{0x4E});
-    Register(body, kOr, r.Invalid, r.Invalid, r.Temporary);
-    Register(body, kShuffleDwords, r.Temporary, 0, r.Invalid, std::uint8_t{0xB1});
-    Register(body, kOr, r.Invalid, r.Invalid, r.Temporary);
+    _orReduce(body, r.Invalid, r.Temporary);
     _constant(body, kAnd, r.Invalid, r.Invalid, kInvalidFlag);
     VexEncoding::StackOperand(body, kControl, kStoreControl, 0, control);
-    VexEncoding::StackOperand(body, kLoadDword, r.Temporary, 0, control);
-    Register(body, kOr, r.Temporary, r.Temporary, r.Invalid);
-    VexEncoding::StackOperand(body, kStoreDword, r.Temporary, 0, control);
-    VexEncoding::StackOperand(body, kControl, kLoadControl, 0, control);
+    _raiseFlags(body, r.Invalid, r.Temporary, control, control);
+}
+
+class ScratchPool {
+public:
+    ScratchPool(const std::array<std::uint8_t, 16>& registers, const std::size_t count) : _registers(registers), _count(count) {}
+
+    [[nodiscard]] std::uint8_t Take() {
+        for (std::size_t index = 0; index < _count; ++index) {
+            if (_busy[index]) continue;
+            _busy[index] = true;
+            return _registers[index];
+        }
+        throw CodegenException(std::string(kFloatToHalfName) + " lowering ran out of scratch registers");
+    }
+
+    void Give(const std::uint8_t reg) {
+        for (std::size_t index = 0; index < _count; ++index) {
+            if (_registers[index] != reg) continue;
+            _busy[index] = false;
+            return;
+        }
+        throw CodegenException(std::string(kFloatToHalfName) + " lowering released a register it does not own");
+    }
+
+private:
+    std::array<std::uint8_t, 16> _registers;
+    std::size_t _count;
+    std::array<bool, 16> _busy{};
+};
+
+struct ModeSlots {
+    std::int32_t Near;
+    std::int32_t Up;
+    std::int32_t Down;
+    std::int32_t Flush;
+};
+
+std::uint8_t _floatsToHalfs(StubBodyBuilder& body, ScratchPool& pool, const ModeSlots& slots, const std::uint8_t input, const bool ownsInput, const std::uint8_t flags) {
+    const auto sign = pool.Take();
+    _constant(body, kAnd, sign, input, 0x80000000);
+    const auto magnitude = pool.Take();
+    _constant(body, kAnd, magnitude, input, 0x7FFFFFFF);
+    if (ownsInput) pool.Give(input);
+
+    const auto flushed = pool.Take();
+    _constant(body, kGreaterDwords, flushed, magnitude, 0x007FFFFF);
+    const auto denormal = pool.Take();
+    _constant(body, kGreaterDwords, denormal, magnitude, 0);
+    Register(body, kAndNot, denormal, flushed, denormal);
+    VexEncoding::StackOperand(body, kAnd, flushed, denormal, slots.Flush);
+    Register(body, kAndNot, magnitude, flushed, magnitude);
+    Register(body, kAndNot, denormal, flushed, denormal);
+    pool.Give(flushed);
+    const auto bits = pool.Take();
+    _constant(body, kAnd, bits, denormal, kDenormalFlag);
+    pool.Give(denormal);
+
+    const auto negative = pool.Take();
+    Register(body, kShiftDwords, kShiftArithmetic, negative, sign, std::uint8_t{31});
+    const auto away = pool.Take();
+    VexEncoding::StackOperand(body, kAndNot, away, negative, slots.Up);
+    VexEncoding::StackOperand(body, kAnd, negative, negative, slots.Down);
+    Register(body, kOr, away, away, negative);
+    pool.Give(negative);
+
+    const auto special = pool.Take();
+    _constant(body, kGreaterDwords, special, magnitude, 0x7F7FFFFF);
+    const auto normal = pool.Take();
+    _constant(body, kGreaterDwords, normal, magnitude, 0x387FFFFF);
+
+    const auto half = pool.Take();
+    _constant(body, kOr, half, sign, 0x3F000000);
+    const auto value = pool.Take();
+    Register(body, kOr, value, sign, magnitude);
+    const auto rounded = pool.Take();
+    Register(body, kAddFloats, rounded, value, half);
+    const auto inexact = pool.Take();
+    Register(body, kSubtractFloats, inexact, rounded, half);
+    pool.Give(half);
+    Register(body, kCompareFloats, inexact, inexact, value, kNotEqualOrdered);
+    pool.Give(value);
+    _constant(body, kAnd, rounded, rounded, 0x7FFFFFFF);
+    _constant(body, kSubtractDwords, rounded, rounded, 0x3F000000);
+
+    const auto first = pool.Take();
+    const auto second = pool.Take();
+    VexEncoding::StackOperand(body, kOr, first, away, slots.Near);
+    _constant(body, kAndNot, first, first, 0x38800000);
+    VexEncoding::StackOperand(body, kLoadVector, second, 0, slots.Near);
+    _constant(body, kAnd, second, second, 0x387FF000);
+    Register(body, kOr, first, first, second);
+    _constant(body, kAnd, second, away, 0x387FE001);
+    Register(body, kOr, first, first, second);
+    Register(body, kGreaterDwords, first, first, magnitude);
+    Register(body, kAnd, first, first, inexact);
+    Register(body, kAndNot, first, normal, first);
+    _constant(body, kAnd, first, first, kUnderflowFlag);
+    Register(body, kOr, bits, bits, first);
+
+    Register(body, kShiftDwords, kShiftRight, first, magnitude, std::uint8_t{13});
+    _constant(body, kAnd, first, first, 1);
+    _constant(body, kAddDwords, first, first, 0x0FFF);
+    VexEncoding::StackOperand(body, kAnd, first, first, slots.Near);
+    _constant(body, kAnd, second, away, 0x1FFF);
+    Register(body, kOr, first, first, second);
+    _constant(body, kSubtractDwords, second, magnitude, 0x38000000);
+    Register(body, kAddDwords, second, second, first);
+    Register(body, kShiftDwords, kShiftRight, second, second, std::uint8_t{13});
+    _constant(body, kGreaterDwords, first, second, 0x7BFF);
+    const auto limit = pool.Take();
+    VexEncoding::StackOperand(body, kOr, limit, away, slots.Near);
+    pool.Give(away);
+    _constant(body, kAnd, limit, limit, 1);
+    _constant(body, kAddDwords, limit, limit, 0x7BFF);
+    Register(body, kBlendBytes, second, second, limit, static_cast<std::uint8_t>(first << 4));
+    _constant(body, kAnd, limit, magnitude, 0x1FFF);
+    _constant(body, kEqualDwords, limit, limit, 0);
+    _constant(body, kAndNot, limit, limit, 0xFFFFFFFF);
+    Register(body, kOr, limit, limit, first);
+    Register(body, kAnd, first, first, normal);
+    Register(body, kAndNot, first, special, first);
+    _constant(body, kAnd, first, first, kOverflowFlag);
+    Register(body, kOr, bits, bits, first);
+
+    Register(body, kBlendBytes, rounded, rounded, second, static_cast<std::uint8_t>(normal << 4));
+    Register(body, kBlendBytes, inexact, inexact, limit, static_cast<std::uint8_t>(normal << 4));
+    pool.Give(limit);
+    pool.Give(normal);
+    Register(body, kAndNot, inexact, special, inexact);
+    _constant(body, kAnd, inexact, inexact, kPrecisionFlag);
+    Register(body, kOr, bits, bits, inexact);
+    pool.Give(inexact);
+
+    _constant(body, kGreaterDwords, first, magnitude, 0x7F800000);
+    _constant(body, kAnd, second, magnitude, 0x00400000);
+    _constant(body, kEqualDwords, second, second, 0x00400000);
+    Register(body, kAndNot, second, second, first);
+    _constant(body, kAnd, second, second, kInvalidFlag);
+    Register(body, kOr, bits, bits, second);
+    Register(body, kShiftDwords, kShiftRight, second, magnitude, std::uint8_t{13});
+    pool.Give(magnitude);
+    _constant(body, kAnd, second, second, 0x01FF);
+    _constant(body, kOr, second, second, 0x7E00);
+    Register(body, kAnd, second, second, first);
+    _constant(body, kAndNot, first, first, 0x7C00);
+    Register(body, kOr, second, second, first);
+    pool.Give(first);
+    Register(body, kBlendBytes, rounded, rounded, second, static_cast<std::uint8_t>(special << 4));
+    pool.Give(second);
+    pool.Give(special);
+
+    Register(body, kShiftDwords, kShiftRight, sign, sign, std::uint8_t{16});
+    Register(body, kOr, rounded, rounded, sign);
+    pool.Give(sign);
+    Register(body, kOr, flags, flags, bits);
+    pool.Give(bits);
+    return rounded;
 }
 
 }
@@ -108,6 +290,17 @@ std::optional<HalfToFloatOperands> DecodeHalfToFloat(const std::uint8_t* data, c
     if (instruction->Vvvv != 0) throw CodegenException("VCVTPH2PS with VEX.vvvv other than 1111b is undefined");
     if (instruction->End != length) throw CodegenException("VCVTPH2PS has trailing bytes");
     return HalfToFloatOperands{instruction->Vector256, instruction->Reg, instruction->Rm, instruction->Memory};
+}
+
+std::optional<FloatToHalfOperands> DecodeFloatToHalf(const std::uint8_t* data, const std::size_t length) {
+    const auto instruction = Decode(data, length);
+    if (!instruction || instruction->Map != Map0F3A || instruction->Prefix != Prefix66 || instruction->Opcode != 0x1D)
+        return std::nullopt;
+    if (instruction->Wide) throw CodegenException("VCVTPS2PH with VEX.W1 is undefined");
+    if (instruction->Vvvv != 0) throw CodegenException("VCVTPS2PH with VEX.vvvv other than 1111b is undefined");
+    if (instruction->End >= length) throw CodegenException("VCVTPS2PH is missing its immediate");
+    if (instruction->End + 1 != length) throw CodegenException("VCVTPS2PH has trailing bytes");
+    return FloatToHalfOperands{instruction->Vector256, instruction->Reg, instruction->Rm, data[instruction->End], instruction->Memory};
 }
 
 void EmitHalfToFloat(StubBodyBuilder& body, const HalfToFloatOperands& operands) {
@@ -143,6 +336,89 @@ void EmitHalfToFloat(StubBodyBuilder& body, const HalfToFloatOperands& operands)
     }
     _raiseInvalid(body, r, control);
     for (std::size_t index = 0; index < count; ++index)
+        VexEncoding::StackOperand(body, MoveUnaligned256Load, scratch[index], 0, static_cast<std::int32_t>(index * 32));
+    StackSlot(body, 0x8D, true, Stack, frame);
+}
+
+void EmitFloatToHalf(StubBodyBuilder& body, const FloatToHalfOperands& operands) {
+    std::array<bool, 16> used{};
+    used[operands.Source] = true;
+    if (!operands.Memory) used[operands.Destination] = true;
+    std::array<std::uint8_t, 16> scratch{};
+    std::size_t taken = 0;
+    for (std::uint8_t reg = 15; taken < kFloatToHalfScratch; --reg)
+        if (!used[reg]) scratch[taken++] = reg;
+    const auto base = static_cast<std::int32_t>(32 * kFloatToHalfScratch);
+    const ModeSlots slots{base, base + 16, base + 32, base + 48};
+    const auto upperSlot = base + 64;
+    const auto saved = base + 80;
+    const auto work = base + 84;
+    const auto frame = kRedZone + base + 96;
+    StackSlot(body, 0x8D, true, Stack, -frame);
+    for (std::size_t index = 0; index < kFloatToHalfScratch; ++index)
+        VexEncoding::StackOperand(body, MoveUnaligned256Store, scratch[index], 0, static_cast<std::int32_t>(index * 32));
+    ScratchPool pool(scratch, kFloatToHalfScratch);
+
+    VexEncoding::StackOperand(body, kControl, kStoreControl, 0, saved);
+    const auto mode = pool.Take();
+    if ((operands.Immediate & 4) != 0) {
+        VexEncoding::StackOperand(body, kLoadDword, mode, 0, saved);
+        Register(body, kShiftDwords, kShiftRight, mode, mode, std::uint8_t{13});
+        _constant(body, kAnd, mode, mode, 3);
+        Register(body, kShuffleDwords, mode, 0, mode, std::uint8_t{0});
+    } else {
+        _constant(body, kLoadVector, mode, 0, operands.Immediate & 3u);
+    }
+    const auto mask = pool.Take();
+    _constant(body, kEqualDwords, mask, mode, 0);
+    VexEncoding::StackOperand(body, kStoreVector, mask, 0, slots.Near);
+    _constant(body, kEqualDwords, mask, mode, 2);
+    VexEncoding::StackOperand(body, kStoreVector, mask, 0, slots.Up);
+    _constant(body, kEqualDwords, mask, mode, 1);
+    VexEncoding::StackOperand(body, kStoreVector, mask, 0, slots.Down);
+    Register(body, kShiftDwords, kShiftLeft, mode, mode, std::uint8_t{13});
+    _constant(body, kOr, mode, mode, 0x1F80);
+    VexEncoding::StackOperand(body, kStoreDword, mode, 0, work);
+    VexEncoding::StackOperand(body, kLoadDword, mask, 0, saved);
+    _constant(body, kAnd, mask, mask, 0x40);
+    _constant(body, kEqualDwords, mask, mask, 0x40);
+    Register(body, kShuffleDwords, mask, 0, mask, std::uint8_t{0});
+    VexEncoding::StackOperand(body, kStoreVector, mask, 0, slots.Flush);
+    pool.Give(mask);
+    pool.Give(mode);
+    VexEncoding::StackOperand(body, kControl, kLoadControl, 0, work);
+
+    const auto flags = pool.Take();
+    Register(body, kExclusiveOr, flags, flags, flags);
+    std::uint8_t lower = 0;
+    std::uint8_t upper = 0;
+    if (operands.Wide) {
+        const auto extracted = pool.Take();
+        ExtractUpper(body, extracted, operands.Source);
+        const auto halfs = _floatsToHalfs(body, pool, slots, extracted, true, flags);
+        VexEncoding::StackOperand(body, kStoreVector, halfs, 0, upperSlot);
+        pool.Give(halfs);
+        lower = _floatsToHalfs(body, pool, slots, operands.Source, false, flags);
+        upper = pool.Take();
+        VexEncoding::StackOperand(body, kLoadVector, upper, 0, upperSlot);
+    } else {
+        lower = _floatsToHalfs(body, pool, slots, operands.Source, false, flags);
+        upper = pool.Take();
+        Register(body, kExclusiveOr, upper, upper, upper);
+    }
+    if (operands.Memory) {
+        Register(body, kPackDwords, lower, lower, upper);
+        VexEncoding::Memory(body, operands.Wide ? kStoreVector : kStoreQword, lower, 0, *operands.Memory, frame, kFloatToHalfName);
+    } else {
+        Register(body, kPackDwords, operands.Destination, lower, upper);
+    }
+    pool.Give(lower);
+    _orReduce(body, flags, upper);
+    _raiseFlags(body, flags, upper, saved, work);
+    pool.Give(upper);
+    pool.Give(flags);
+
+    for (std::size_t index = 0; index < kFloatToHalfScratch; ++index)
         VexEncoding::StackOperand(body, MoveUnaligned256Load, scratch[index], 0, static_cast<std::int32_t>(index * 32));
     StackSlot(body, 0x8D, true, Stack, frame);
 }

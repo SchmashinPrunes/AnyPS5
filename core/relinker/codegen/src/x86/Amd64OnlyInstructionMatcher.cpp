@@ -323,6 +323,10 @@ const char* Amd64OnlyInstructionMatcher::_emitOutOfLine(StubBodyBuilder& body, c
         EmitHalfToFloat(body, *half);
         return "VCVTPH2PS";
     }
+    if (const auto half = _target == Amd64OnlyTarget::Avx ? DecodeFloatToHalf(instr.Data, instr.Length) : std::nullopt) {
+        EmitFloatToHalf(body, *half);
+        return "VCVTPS2PH";
+    }
     if (const auto permute = _target == Amd64OnlyTarget::Avx ? DecodePermute(instr.Data, instr.Length) : std::nullopt) {
         EmitPermute(body, *permute);
         return permute->Name;
@@ -534,6 +538,9 @@ std::optional<Amd64OnlyMatch> Amd64OnlyInstructionMatcher::Match(
 
     if (const auto half = _target == Amd64OnlyTarget::Avx ? DecodeHalfToFloat(data, length) : std::nullopt)
         return _trampoline("VCVTPH2PS", length, _outOfLine(length, trailing, [&](StubBodyBuilder& body) { EmitHalfToFloat(body, *half); }), false, true);
+
+    if (const auto half = _target == Amd64OnlyTarget::Avx ? DecodeFloatToHalf(data, length) : std::nullopt)
+        return _trampoline("VCVTPS2PH", length, _outOfLine(length, trailing, [&](StubBodyBuilder& body) { EmitFloatToHalf(body, *half); }), false, true);
 
     if (const auto permute = _target == Amd64OnlyTarget::Avx ? DecodePermute(data, length) : std::nullopt)
         return _trampoline(permute->Name, length, _outOfLine(length, trailing, [&](StubBodyBuilder& body) { EmitPermute(body, *permute); }), false, true);
