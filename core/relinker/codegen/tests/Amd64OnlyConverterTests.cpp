@@ -2074,8 +2074,9 @@ void clzeroExecution() {
     }
     for (const auto& item : cases) {
         require(item.Match.has_value(), item.Name);
-        auto* buffer = static_cast<std::uint8_t*>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | (item.Low ? MAP_32BIT : 0), -1, 0));
+        auto* buffer = static_cast<std::uint8_t*>(mmap(item.Low ? reinterpret_cast<void*>(std::uintptr_t{0x40000000}) : nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | (item.Low ? MAP_32BIT : 0), -1, 0));
         require(buffer != MAP_FAILED, "cannot map the CLZERO buffer");
+        require(!item.Low || reinterpret_cast<std::uintptr_t>(buffer) + 4096 <= (std::uintptr_t{1} << 32), "the CLZERO buffer for the 32-bit address form is not below 4 GiB");
         for (const std::size_t offset : {std::size_t{0x80}, std::size_t{0xAD}, std::size_t{0xFF}}) {
             std::memset(buffer, 0xA5, 4096);
             const auto address = reinterpret_cast<std::uint64_t>(buffer + offset);
