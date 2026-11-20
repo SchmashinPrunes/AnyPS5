@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <functional>
+#include <random>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -118,7 +120,7 @@ struct State {
 
 class Execution {
 public:
-    Execution(const Bytes& site, std::uint64_t memoryValue, std::optional<std::size_t> clobberOffset = std::nullopt) {
+    Execution(const Bytes& site, std::uint64_t memoryValue, std::optional<std::size_t> clobberOffset = std::nullopt, bool native = false) {
         auto operands = Codegen::DecodeMulx(site.data(), site.size());
         require(operands.has_value(), "Execution site was not MULX");
         for (auto reg : {3, 5, 6, 7, 12, 13, 14, 15}) push(static_cast<std::uint8_t>(reg));
@@ -142,19 +144,21 @@ public:
             if (reg != 4 && reg != 7) memory(0x8B, reg, 7, reg * 8);
         memory(0x8B, 7, 7, 7 * 8);
         const auto siteOffset = bytes.size();
+        auto relocated = site;
         if (operands->Memory && operands->Memory->RipRelative) {
-            auto relocated = site;
             const auto displacement = static_cast<std::int32_t>(4096 + 24 - (siteOffset + site.size()));
             std::memcpy(relocated.data() + relocated.size() - 4, &displacement, sizeof(displacement));
             operands = Codegen::DecodeMulx(relocated.data(), relocated.size());
         }
+        if (native) bytes.insert(bytes.end(), relocated.begin(), relocated.end());
         Codegen::StubBodyBuilder builder;
         Codegen::EmitMulx(builder, *operands);
         auto body = builder.Finish();
         const auto stubOffset = bytes.size();
         Codegen::ApplyStubRelocations(body.Bytes, body.Relocations, siteOffset, stubOffset, 0);
         const auto stubEnd = static_cast<std::ptrdiff_t>(body.ReturnBranchOffset);
-        if (clobberOffset) {
+        if (native) {
+        } else if (clobberOffset) {
             const auto cut = static_cast<std::ptrdiff_t>(*clobberOffset);
             bytes.insert(bytes.end(), body.Bytes.begin(), body.Bytes.begin() + cut);
             for (std::int32_t disp = -256; disp < -128; disp += 4) {
@@ -287,6 +291,28 @@ State initialState() {
     return state;
 }
 
+bool hostHasBmi2() {
+    return __builtin_cpu_supports("bmi2") != 0;
+}
+
+void compareNative(const Bytes& site, std::uint64_t memoryValue, State initial, const State& lowered, const std::function<void(State&, const void*)>& prepare = {}) {
+    if (!hostHasBmi2()) return;
+    const auto decoded = *Codegen::DecodeMulx(site.data(), site.size());
+    if (!decoded.Memory && decoded.Source == 4) return;
+    const Execution native(site, memoryValue, std::nullopt, true);
+    if (prepare) prepare(initial, native.Memory());
+    native.Run(initial);
+    const auto operands = *Codegen::DecodeMulx(site.data(), site.size());
+    for (const auto reg : {operands.HighDestination, operands.LowDestination}) {
+        if (lowered.Output[reg] == initial.Output[reg]) continue;
+        char text[192];
+        std::snprintf(text, sizeof text, "MULX %d high %u low %u: register %u is %#llx, the native instruction gives %#llx", operands.Wide ? 64 : 32, static_cast<unsigned>(operands.HighDestination),
+            static_cast<unsigned>(operands.LowDestination), static_cast<unsigned>(reg), static_cast<unsigned long long>(lowered.Output[reg]), static_cast<unsigned long long>(initial.Output[reg]));
+        throw std::runtime_error(text);
+    }
+    require(((lowered.Flags ^ initial.Flags) & 0x8D5u) == 0, "MULX flags differ from the native instruction");
+}
+
 void execution() {
     for (bool wide : {false, true}) {
         for (std::uint8_t high = 0; high < 16; ++high) {
@@ -309,8 +335,10 @@ void execution() {
                             }
                         }
                         state.InputFlags |= variant % 2 == 0 ? 0x8D5 : 0;
+                        const auto initial = state;
                         executable.Run(state);
                         check(state, *Codegen::DecodeMulx(site.data(), site.size()), state.Input[source]);
+                        if (variant % 4 == 0) compareNative(site, 0, initial, state);
                     }
                 }
             }
@@ -324,12 +352,15 @@ void execution() {
                     site.insert(site.end(), {static_cast<std::uint8_t>(base == 4 ? 64 : 16), 0, 0, 0});
                     constexpr std::uint64_t value = 0xFEDCBA9876543210ull;
                     Execution executable(site, value);
+                    const auto place = [&](State& placed, const void* memory) { placed.Input[base] = reinterpret_cast<std::uint64_t>(memory) - 16; };
                     auto state = initialState();
-                    state.Input[base] = reinterpret_cast<std::uint64_t>(executable.Memory()) - 16;
                     state.Output[0] = value;
                     state.InputFlags |= 0x895;
+                    const auto initial = state;
+                    place(state, executable.Memory());
                     executable.Run(state);
                     check(state, *Codegen::DecodeMulx(site.data(), site.size()), value);
+                    if (base != 2 && base != 4) compareNative(site, value, initial, state, place);
                 }
             }
         }
@@ -353,8 +384,10 @@ void execution() {
             auto state = initialState();
             for (unsigned bit = 0; bit < 6; ++bit)
                 if ((bits >> bit) & 1) state.InputFlags |= std::uint64_t{1} << std::array{0, 2, 4, 6, 7, 11}[bit];
+            const auto initial = state;
             executable.Run(state);
             check(state, *Codegen::DecodeMulx(site.data(), site.size()), state.Input[2]);
+            compareNative(site, 0, initial, state);
         }
         for (const auto [high, low, source] : {std::tuple<std::uint8_t, std::uint8_t, std::uint8_t>{4, 1, 6}, {1, 4, 6}, {4, 4, 6}, {4, 1, 4}, {1, 4, 4}}) {
             const auto stackSite = instruction(wide, high, low, source);
@@ -373,8 +406,47 @@ void execution() {
     }
     std::cout << "Executed 73,868 MULX cases with register, flag and red-zone checks\n";
 }
+
+void nativeSweep() {
+    if (!hostHasBmi2()) {
+        std::cout << "the host has no BMI2: the MULX lowering was checked against the model only\n";
+        return;
+    }
+    std::mt19937_64 random(20261121);
+    for (bool wide : {false, true}) {
+        for (const auto [high, low, source] : {std::tuple<std::uint8_t, std::uint8_t, std::uint8_t>{1, 0, 6}, {9, 9, 3}, {2, 15, 2}, {14, 2, 11}}) {
+            const auto site = instruction(wide, high, low, source);
+            const auto operands = *Codegen::DecodeMulx(site.data(), site.size());
+            const Execution lowered(site, 0);
+            const Execution native(site, 0, std::nullopt, true);
+            for (unsigned round = 0; round < 20000; ++round) {
+                auto state = initialState();
+                const auto pick = [&]() -> std::uint64_t {
+                    const auto bits = random();
+                    switch (random() % 4) {
+                    case 0: return bits;
+                    case 1: return ~std::uint64_t{0} >> (random() % 64);
+                    case 2: return std::uint64_t{1} << (random() % 64);
+                    default: return bits & 0xFFFFFFFFull;
+                    }
+                };
+                state.Input[2] = pick();
+                state.Input[source] = pick();
+                if (round % 2 == 1) state.InputFlags |= 0x8D5;
+                auto expected = state;
+                lowered.Run(state);
+                native.Run(expected);
+                check(state, operands, state.Input[source]);
+                for (const auto reg : {operands.HighDestination, operands.LowDestination})
+                    require(state.Output[reg] == expected.Output[reg], "MULX differs from the native instruction in the random sweep");
+                require(((state.Flags ^ expected.Flags) & 0x8D5u) == 0, "MULX flags differ from the native instruction in the random sweep");
+            }
+        }
+    }
+}
 #else
 void execution() { std::cout << "MULX execution checks require an x86-64 build\n"; }
+void nativeSweep() {}
 #endif
 
 }
@@ -384,6 +456,7 @@ int main() {
         decoding();
         matching();
         execution();
+        nativeSweep();
         std::cout << "MULX lowering checks passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
