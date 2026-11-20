@@ -5,6 +5,8 @@
 #include <array>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -138,13 +140,30 @@ void check(const State& state, const Codegen::BitfieldOperands& operands, std::u
     for (const auto value : state.RedZone) require(value == LoweringExecution::kSentinel, std::string(name) + " overwrote the caller's red zone");
 }
 
-void run(const Execution& execution, const Codegen::BitfieldOperands& operands, State state, std::uint64_t memoryValue) {
+bool hostHasExtension(const Codegen::BitfieldOperands& operands) {
+    if (operands.Operation == BitfieldOperation::ZeroHigh) return __builtin_cpu_supports("bmi2") != 0;
+    return __builtin_cpu_supports("bmi") != 0;
+}
+
+std::unique_ptr<Execution> native(const Bytes& site, const Codegen::BitfieldOperands& operands, std::uint64_t memoryValue, const LoweringExecution::Before& before = {}) {
+    if (!hostHasExtension(operands)) return nullptr;
+    return LoweringExecution::NativeExecution(site, memoryValue, operands.Memory && operands.Memory->RipRelative, before);
+}
+
+void run(const Execution& execution, const Execution* reference, const Codegen::BitfieldOperands& operands, State state, std::uint64_t memoryValue, const LoweringExecution::Prepare& prepare = {}) {
     for (const auto flags : {LoweringExecution::kBaseFlags | LoweringExecution::kFlagMask, LoweringExecution::kBaseFlags}) {
         state.InputFlags = flags;
         auto trial = state;
+        if (prepare) prepare(trial, execution.Memory());
         execution.Run(trial);
         const auto source = operands.Memory ? memoryValue : trial.Input[operands.Source];
         check(trial, operands, source, trial.Input[operands.Control]);
+        if (!reference || operands.Control == 4 || (!operands.Memory && operands.Source == 4)) continue;
+        auto hardware = state;
+        if (prepare) prepare(hardware, reference->Memory());
+        reference->Run(hardware);
+        const auto difference = LoweringExecution::DifferenceFromNative(trial, hardware, {operands.Destination}, expected(operands, source, trial.Input[operands.Control]).FlagMask);
+        require(difference.empty(), std::string(Codegen::BitfieldName(operands.Operation)) + (operands.Wide ? " 64" : " 32") + " dst " + std::to_string(operands.Destination) + " (source " + std::to_string(source) + ", control " + std::to_string(trial.Input[operands.Control]) + "): " + difference);
     }
 }
 
@@ -158,12 +177,13 @@ void execution() {
                     const auto site = instruction(operation, wide, dst, pair.first, pair.second);
                     const auto operands = *Codegen::DecodeBitfield(site.data(), site.size());
                     const auto execution = executable(site, 0);
+                    const auto reference = native(site, operands, 0);
                     for (const auto value : values) {
                         for (const auto control : controls) {
                             auto state = LoweringExecution::InitialState();
                             state.Input[pair.first] = value;
                             state.Input[pair.second] = control;
-                            run(execution, operands, state, 0);
+                            run(execution, reference.get(), operands, state, 0);
                         }
                     }
                 }
@@ -178,14 +198,16 @@ void execution() {
                         const auto site = memorySite(operation, wide, tail);
                         const auto operands = *Codegen::DecodeBitfield(site.data(), site.size());
                         const auto execution = executable(site, value);
+                        const auto reference = native(site, operands, value);
                         auto state = LoweringExecution::InitialState();
-                        state.Input[6] = reinterpret_cast<std::uint64_t>(execution.Memory()) - (tail[0] == 0x46 ? 16 : 0);
-                        state.Input[2] = reinterpret_cast<std::uint64_t>(execution.Memory()) - 3 * 8;
                         state.Input[1] = 3;
-                        state.Input[5] = reinterpret_cast<std::uint64_t>(execution.Memory()) - 16;
                         state.Input[7] = control;
                         state.Output[0] = value;
-                        run(execution, operands, state, value);
+                        run(execution, reference.get(), operands, state, value, [&](State& placed, const void* memory) {
+                            placed.Input[6] = reinterpret_cast<std::uint64_t>(memory) - (tail[0] == 0x46 ? 16 : 0);
+                            placed.Input[2] = reinterpret_cast<std::uint64_t>(memory) - 3 * 8;
+                            placed.Input[5] = reinterpret_cast<std::uint64_t>(memory) - 16;
+                        });
                     }
                 }
             }
@@ -197,7 +219,7 @@ void execution() {
                     constexpr std::uint64_t value = 0xFEDCBA9876543210ull;
                     const auto site = memorySite(operation, wide, tail);
                     const auto operands = *Codegen::DecodeBitfield(site.data(), site.size());
-                    const Execution execution(site, value, false, [&](Codegen::StubBodyBuilder& body, const Bytes&) {
+                    const auto fill = [&](Codegen::StubBodyBuilder& body) {
                         for (int part = 0; part < 2; ++part) {
                             Bytes store{0xC7, 0x84, 0x24};
                             const auto slot = static_cast<std::uint32_t>(displacement + part * 4);
@@ -206,17 +228,59 @@ void execution() {
                             for (unsigned s = 0; s < 32; s += 8) store.push_back(static_cast<std::uint8_t>(word >> s));
                             body.Raw(store);
                         }
+                    };
+                    const Execution execution(site, value, false, [&](Codegen::StubBodyBuilder& body, const Bytes&) {
+                        fill(body);
                         Codegen::EmitBitfield(body, operands);
                     });
+                    const auto reference = native(site, operands, value, fill);
                     auto state = LoweringExecution::InitialState();
                     state.Input[7] = 0x0C04;
-                    run(execution, operands, state, value);
+                    run(execution, reference.get(), operands, state, value);
+                }
+            }
+        }
+    }
+}
+std::uint64_t edgeBiased(std::mt19937_64& random) {
+    const auto bits = random();
+    switch (random() % 6) {
+    case 0: return bits;
+    case 1: return std::uint64_t{1} << (bits % 64);
+    case 2: return (std::uint64_t{1} << (bits % 64)) - 1;
+    case 3: return bits & 0xFFFFFFFFull;
+    case 4: return bits << (random() % 64);
+    default: return bits >> (random() % 64);
+    }
+}
+
+void nativeSweep() {
+    std::mt19937_64 random(20261121);
+    for (const auto operation : kOperations) {
+        const auto probe = instruction(operation, false, 0, 6, 2);
+        if (!hostHasExtension(*Codegen::DecodeBitfield(probe.data(), probe.size()))) {
+            std::cout << "the host lacks " << (operation == BitfieldOperation::ZeroHigh ? "BMI2" : "BMI1") << ": " << Codegen::BitfieldName(operation) << " was checked against the model only\n";
+            continue;
+        }
+        for (bool wide : {false, true}) {
+            for (const auto registers : std::array<std::array<std::uint8_t, 3>, 3>{{{0, 6, 2}, {9, 9, 1}, {15, 3, 3}}}) {
+                const auto site = instruction(operation, wide, registers[0], registers[1], registers[2]);
+                const auto operands = *Codegen::DecodeBitfield(site.data(), site.size());
+                const auto reference = native(site, operands, 0);
+                const auto execution = executable(site, 0);
+                for (unsigned round = 0; round < 10000; ++round) {
+                    auto state = LoweringExecution::InitialState();
+                    state.Input[registers[1]] = edgeBiased(random);
+                    const auto control = random();
+                    if (registers[2] != registers[1]) state.Input[registers[2]] = round % 4 == 0 ? control : control & (round % 4 == 1 ? 0xFFu : 0x7F7Fu);
+                    run(execution, reference.get(), operands, state, 0);
                 }
             }
         }
     }
 }
 #else
+void nativeSweep() {}
 void execution() { std::cout << "bitfield execution checks require an x86-64 Linux, macOS or Windows build\n"; }
 #endif
 
@@ -227,6 +291,7 @@ int main() {
         decoding();
         matching();
         execution();
+        nativeSweep();
         std::cout << "bitfield lowering checks passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
