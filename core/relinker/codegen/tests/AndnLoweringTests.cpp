@@ -6,6 +6,7 @@
 #include <array>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -81,6 +82,19 @@ Execution executable(const Bytes& site, std::uint64_t memoryValue) {
     });
 }
 
+bool hostHasBmi1() {
+    return __builtin_cpu_supports("bmi") != 0;
+}
+
+void compareNative(const Bytes& site, std::uint64_t memoryValue, const State& initial, const State& lowered, const LoweringExecution::Prepare& prepare = {}, const LoweringExecution::Before& before = {}) {
+    if (!hostHasBmi1()) return;
+    const auto operands = *Codegen::DecodeAndn(site.data(), site.size());
+    if (operands.InvertedSource == 4 || (!operands.Memory && operands.Source == 4)) return;
+    const auto native = LoweringExecution::RunNative(site, memoryValue, operands.Memory && operands.Memory->RipRelative, initial, prepare, before);
+    const auto difference = LoweringExecution::DifferenceFromNative(lowered, native, {operands.Destination}, LoweringExecution::kFlagMask);
+    require(difference.empty(), (std::string("ANDN") + (operands.Wide ? " 64" : " 32") + " dst " + std::to_string(operands.Destination) + ": " + difference).c_str());
+}
+
 void check(const State& state, const Codegen::AndnOperands& operands, std::uint64_t second) {
     const auto mask = operands.Wide ? ~std::uint64_t{0} : 0xFFFFFFFFull;
     const auto expected = (~state.Input[operands.InvertedSource] & second) & mask;
@@ -101,8 +115,10 @@ void execution() {
                     auto state = LoweringExecution::InitialState();
                     if (variant == 1) state.Input.fill(0);
                     if (variant == 2) state.Input.fill(~std::uint64_t{0});
+                    const auto initial = state;
                     run.Run(state);
                     check(state, *Codegen::DecodeAndn(site.data(), site.size()), state.Input[pair.second]);
+                    compareNative(site, 0, initial, state);
                 }
             }
         }
@@ -111,14 +127,19 @@ void execution() {
             site.insert(site.end(), tail.begin(), tail.end());
             constexpr std::uint64_t value = 0xFEDCBA9876543210ull;
             const auto run = executable(site, value);
+            const auto place = [&](State& placed, const void* memory) {
+                placed.Input[6] = reinterpret_cast<std::uint64_t>(memory) - (tail[0] == 0x46 ? 16 : 0);
+                placed.Input[2] = reinterpret_cast<std::uint64_t>(memory) - 3 * 8;
+                placed.Input[5] = reinterpret_cast<std::uint64_t>(memory) - 16;
+            };
             auto state = LoweringExecution::InitialState();
-            state.Input[6] = reinterpret_cast<std::uint64_t>(run.Memory()) - (tail[0] == 0x46 ? 16 : 0);
-            state.Input[2] = reinterpret_cast<std::uint64_t>(run.Memory()) - 3 * 8;
             state.Input[1] = 3;
-            state.Input[5] = reinterpret_cast<std::uint64_t>(run.Memory()) - 16;
             state.Output[0] = value;
+            const auto initial = state;
+            place(state, run.Memory());
             run.Run(state);
             check(state, *Codegen::DecodeAndn(site.data(), site.size()), value);
+            compareNative(site, value, initial, state, place);
         }
         for (const std::uint8_t dst : std::array<std::uint8_t, 2>{0, 4}) {
             for (const std::int32_t displacement : {-176, -160, -152, -151, -145, -144, -140, -136}) {
@@ -128,7 +149,7 @@ void execution() {
                     site.push_back(static_cast<std::uint8_t>(static_cast<std::uint32_t>(displacement) >> shift));
                 constexpr std::uint64_t value = 0xFEDCBA9876543210ull;
                 const auto operands = *Codegen::DecodeAndn(site.data(), site.size());
-                const Execution run(site, value, false, [&](Codegen::StubBodyBuilder& body, const Bytes&) {
+                const auto fill = [&](Codegen::StubBodyBuilder& body) {
                     for (int part = 0; part < 2; ++part) {
                         Bytes store{0xC7, 0x84, 0x24};
                         const auto slot = static_cast<std::uint32_t>(displacement + part * 4);
@@ -137,11 +158,16 @@ void execution() {
                         for (unsigned shift = 0; shift < 32; shift += 8) store.push_back(static_cast<std::uint8_t>(word >> shift));
                         body.Raw(store);
                     }
+                };
+                const Execution run(site, value, false, [&](Codegen::StubBodyBuilder& body, const Bytes&) {
+                    fill(body);
                     Codegen::EmitAndn(body, operands);
                 });
                 auto state = LoweringExecution::InitialState();
+                const auto initial = state;
                 run.Run(state);
                 check(state, operands, value);
+                compareNative(site, value, initial, state, {}, fill);
             }
         }
         for (const auto pair : {std::pair<std::uint8_t, std::uint8_t>{1, 6}, {4, 9}, {9, 4}}) {
@@ -171,7 +197,47 @@ void execution() {
         }
     }
 }
+std::uint64_t edgeBiased(std::mt19937_64& random) {
+    const auto bits = random();
+    switch (random() % 6) {
+    case 0: return bits;
+    case 1: return std::uint64_t{1} << (bits % 64);
+    case 2: return (std::uint64_t{1} << (bits % 64)) - 1;
+    case 3: return bits & 0xFFFFFFFFull;
+    case 4: return bits << (random() % 64);
+    default: return bits >> (random() % 64);
+    }
+}
+
+void nativeSweep() {
+    if (!hostHasBmi1()) {
+        std::cout << "the host has no BMI1: the ANDN lowering was checked against the model only\n";
+        return;
+    }
+    std::mt19937_64 random(20261121);
+    for (bool wide : {false, true}) {
+        for (const auto registers : std::array<std::array<std::uint8_t, 3>, 4>{{{0, 1, 6}, {9, 9, 10}, {11, 3, 11}, {15, 15, 15}}}) {
+            const auto site = instruction(wide, registers[0], registers[1], registers[2]);
+            const auto operands = *Codegen::DecodeAndn(site.data(), site.size());
+            const auto run = executable(site, 0);
+            const auto native = LoweringExecution::NativeExecution(site, 0, false);
+            for (unsigned round = 0; round < 20000; ++round) {
+                auto state = LoweringExecution::InitialState();
+                state.Input[registers[1]] = edgeBiased(random);
+                state.Input[registers[2]] = round % 3 == 0 ? ~state.Input[registers[1]] : edgeBiased(random);
+                if (round % 2 == 1) state.InputFlags ^= LoweringExecution::kCarry | LoweringExecution::kZero | LoweringExecution::kSign;
+                auto expected = state;
+                run.Run(state);
+                native->Run(expected);
+                check(state, operands, state.Input[registers[2]]);
+                const auto difference = LoweringExecution::DifferenceFromNative(state, expected, {operands.Destination}, LoweringExecution::kFlagMask);
+                require(difference.empty(), (std::string("ANDN") + (wide ? " 64" : " 32") + " dst " + std::to_string(operands.Destination) + ": " + difference).c_str());
+            }
+        }
+    }
+}
 #else
+void nativeSweep() {}
 void execution() { std::cout << "ANDN execution checks require an x86-64 Linux, macOS or Windows build\n"; }
 #endif
 
@@ -182,6 +248,7 @@ int main() {
         decoding();
         matching();
         execution();
+        nativeSweep();
         std::cout << "ANDN lowering checks passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
