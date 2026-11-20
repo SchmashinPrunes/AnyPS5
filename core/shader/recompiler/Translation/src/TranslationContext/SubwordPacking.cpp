@@ -107,17 +107,13 @@ IrU32 TranslationContext::readF16SourceBits(const RdnaOperand& operand) {
 
 IrF32 TranslationContext::readF16AsF32(const RdnaOperand& operand, bool nanPayloadUnused) {
     const IrU32 source = readF16SourceBits(operand);
-    const IrU32 raw = operand.opSel ? IrU32(ir.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&source.Value(), &ir.Constant(16u), &ir.Constant(16u)})) : source;
+    IrU32 raw = operand.opSel ? IrU32(ir.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&source.Value(), &ir.Constant(16u), &ir.Constant(16u)})) : source;
+    if (operand.absolute) raw = IrU32(ir.BitwiseAnd(raw.Value(), ir.Constant(0x7fffu)));
+    if (operand.negate) raw = IrU32(ir.BitwiseXor(raw.Value(), ir.Constant(0x8000u)));
     const IrU16 bits(ir.Emit(IrOpcode::ConvertU16U32, IrType::U16, {&raw.Value()}));
     const IrF16 half(ir.Emit(IrOpcode::BitCastF16U16, IrType::F16, {&bits.Value()}));
     IrF32 value(ir.Emit(IrOpcode::ConvertF32F16, IrType::F32, {&half.Value()}));
     if (nanPayloadUnused) value.Value().SetFlags(FloatConvertFlags{true});
-    if (operand.absolute) {
-        value = IrF32(ir.Emit(IrOpcode::FPAbs32, IrType::F32, {&value.Value()}));
-    }
-    if (operand.negate) {
-        value = IrF32(ir.Emit(IrOpcode::FPNeg32, IrType::F32, {&value.Value()}));
-    }
     return value;
 }
 
