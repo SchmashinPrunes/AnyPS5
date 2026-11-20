@@ -136,6 +136,42 @@ bool TranslationContext::float64Unary(const RdnaInstruction& inst, IrOpcode opco
     IrValue& result = ldexp ? ir.Emit(opcode, IrType::U64, {&argument, exponent}) : ir.Emit(opcode, IrType::U64, {&argument});
     std::array<IrU32, 2> words{IrU32(ir.CompositeExtract(result, 0u)), IrU32(ir.CompositeExtract(result, 1u))};
     if (opcode == IrOpcode::FPFract64) words = flushF64Bits(words, 0x80u);
+    IrValue* clamped = nullptr;
+    if (ldexp) {
+        IrValue& clampLow = ir.Select(ir.Emit(IrOpcode::SLessThan32, IrType::U1, {exponent, &ir.Constant(static_cast<std::uint32_t>(-2200))}), ir.Constant(static_cast<std::uint32_t>(-2200)), *exponent);
+        clamped = &ir.Select(ir.Emit(IrOpcode::SGreaterThan32, IrType::U1, {&clampLow, &ir.Constant(2200u)}), ir.Constant(2200u), clampLow);
+    }
+    const std::uint32_t directed = ldexp ? (rounding.value >> 2u) & 3u : 0u;
+    if (directed != 0u) {
+        IrValue& field = ir.BitwiseAnd(ir.ShiftRightLogical(bits[1].Value(), ir.Constant(20u)), ir.Constant(0x7ffu));
+        IrValue& mantissaHigh = ir.BitwiseAnd(bits[1].Value(), ir.Constant(0x000fffffu));
+        IrValue& sign = ir.BitwiseAnd(bits[1].Value(), ir.Constant(0x80000000u));
+        IrValue& negative = ir.INotEqual(sign, ir.Constant(0u));
+        IrValue& finiteNonzero = ir.LogicalAnd(ir.ULessThan(field, ir.Constant(0x7ffu)), ir.INotEqual(ir.BitwiseOr(field, ir.BitwiseOr(mantissaHigh, bits[0].Value())), ir.Constant(0u)));
+        IrValue& infinite = ir.LogicalAnd(ir.IEqual(ir.BitwiseAnd(words[1].Value(), ir.Constant(0x7fffffffu)), ir.Constant(0x7ff00000u)), ir.IEqual(words[0].Value(), ir.Constant(0u)));
+        IrValue& overflow = ir.LogicalAnd(finiteNonzero, infinite);
+        IrValue& saturate = directed == 3u ? overflow : ir.LogicalAnd(overflow, directed == 1u ? negative : ir.LogicalNot(negative));
+        words = {IrU32(ir.Select(saturate, ir.Constant(0xffffffffu), words[0].Value())), IrU32(ir.Select(saturate, ir.BitwiseOr(sign, ir.Constant(0x7fefffffu)), words[1].Value()))};
+        if ((rounding.value & 0x80u) != 0u) {
+            IrValue& normal = ir.INotEqual(field, ir.Constant(0u));
+            IrValue& significand = ir.ConstructU64(bits[0].Value(), ir.Select(normal, ir.BitwiseOr(mantissaHigh, ir.Constant(0x00100000u)), mantissaHigh));
+            IrValue& lowest = ir.Select(normal, ir.ISub(field, ir.Constant(1075u)), ir.Constant(static_cast<std::uint32_t>(-1074)));
+            IrValue& dropped = ir.ISub(ir.ISub(ir.Constant(static_cast<std::uint32_t>(-1074)), lowest), *clamped);
+            IrValue& belowGrid = ir.Emit(IrOpcode::SGreaterThan32, IrType::U1, {&dropped, &ir.Constant(0u)});
+            IrValue& beyondWord = ir.Emit(IrOpcode::SGreaterThan32, IrType::U1, {&dropped, &ir.Constant(63u)});
+            IrValue& shifted = ir.Emit(IrOpcode::ShiftRightLogical64, IrType::U64, {&significand, &dropped});
+            IrValue& restored = ir.Emit(IrOpcode::ShiftLeftLogical64, IrType::U64, {&shifted, &dropped});
+            IrValue& inexact = ir.LogicalOr(beyondWord, ir.Emit(IrOpcode::INotEqual64, IrType::U1, {&restored, &significand}));
+            IrValue& kept = ir.ConstructU64(ir.Select(beyondWord, ir.Constant(0u), ir.CompositeExtract(shifted, 0u)), ir.Select(beyondWord, ir.Constant(0u), ir.CompositeExtract(shifted, 1u)));
+            IrValue* rounded = &kept;
+            if (directed != 3u) {
+                IrValue& up = ir.LogicalAnd(inexact, directed == 1u ? ir.LogicalNot(negative) : negative);
+                rounded = &ir.Emit(IrOpcode::IAdd64, IrType::U64, {&kept, &ir.ConstructU64(ir.Select(up, ir.Constant(1u), ir.Constant(0u)), ir.Constant(0u))});
+            }
+            IrValue& apply = ir.LogicalAnd(finiteNonzero, belowGrid);
+            words = {IrU32(ir.Select(apply, ir.CompositeExtract(*rounded, 0u), words[0].Value())), IrU32(ir.Select(apply, ir.BitwiseOr(sign, ir.CompositeExtract(*rounded, 1u)), words[1].Value()))};
+        }
+    }
     if (ldexp && floatMode.has_value() && (floatMode->floatMode & 0x80u) == 0u) {
         IrValue& field = ir.ShiftRightLogical(bits[1].Value(), ir.Constant(20u));
         IrValue& biased = ir.BitwiseAnd(field, ir.Constant(0x7ffu));
@@ -147,9 +183,7 @@ bool TranslationContext::float64Unary(const RdnaInstruction& inst, IrOpcode opco
         IrValue& lowMsb = ir.Emit(IrOpcode::FindUMsb32, IrType::U32, {&bits[0].Value()});
         IrValue& msb = ir.Select(ir.INotEqual(mantissaHigh, ir.Constant(0u)), ir.IAdd(highMsb, ir.Constant(32u)), lowMsb);
         IrValue& trueExponent = ir.Select(denormal, ir.ISub(msb, ir.Constant(1074u)), ir.ISub(biased, ir.Constant(1023u)));
-        IrValue& clampLow = ir.Select(ir.Emit(IrOpcode::SLessThan32, IrType::U1, {exponent, &ir.Constant(static_cast<std::uint32_t>(-2200))}), ir.Constant(static_cast<std::uint32_t>(-2200)), *exponent);
-        IrValue& clamped = ir.Select(ir.Emit(IrOpcode::SGreaterThan32, IrType::U1, {&clampLow, &ir.Constant(2200u)}), ir.Constant(2200u), clampLow);
-        IrValue& sum = ir.IAdd(trueExponent, clamped);
+        IrValue& sum = ir.IAdd(trueExponent, *clamped);
         IrValue& belowMin = ir.Emit(IrOpcode::SLessThan32, IrType::U1, {&sum, &ir.Constant(static_cast<std::uint32_t>(-1022))});
         IrValue& tiny = ir.LogicalAnd(finite, ir.LogicalAnd(nonzero, belowMin));
         IrValue& sign = ir.BitwiseAnd(bits[1].Value(), ir.Constant(0x80000000u));
