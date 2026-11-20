@@ -1490,6 +1490,37 @@ void decodeVop2Sdwa(std::uint32_t programCounter, std::span<const std::uint32_t>
     finalizeVop2Instruction(code, wordIndex, instruction);
 }
 
+bool selectsDppSource1(RdnaOpcode opcode) {
+    switch (opcode) {
+        case RdnaOpcode::VSubrevNcU32:
+        case RdnaOpcode::VSubrevCoCiU32:
+        case RdnaOpcode::VLshlrevB32:
+        case RdnaOpcode::VLshrrevB32:
+        case RdnaOpcode::VAshrrevI32:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void moveDppSelection(RdnaOperand& from, RdnaOperand& to) {
+    to.dpp = from.dpp;
+    to.dpp8 = from.dpp8;
+    to.dppCtrl = from.dppCtrl;
+    to.dppRowMask = from.dppRowMask;
+    to.dppBankMask = from.dppBankMask;
+    to.dppFetchInactive = from.dppFetchInactive;
+    to.dppBoundCtrl = from.dppBoundCtrl;
+    const RdnaOperand plain{};
+    from.dpp = plain.dpp;
+    from.dpp8 = plain.dpp8;
+    from.dppCtrl = plain.dppCtrl;
+    from.dppRowMask = plain.dppRowMask;
+    from.dppBankMask = plain.dppBankMask;
+    from.dppFetchInactive = plain.dppFetchInactive;
+    from.dppBoundCtrl = plain.dppBoundCtrl;
+}
+
 void decodeVop2Dpp(std::uint32_t programCounter, std::span<const std::uint32_t> code, std::uint32_t wordIndex, std::uint32_t form, std::uint32_t vdst, std::uint32_t vsrc1, RdnaInstruction& instruction) {
     if (static_cast<std::size_t>(wordIndex) + 1u >= code.size()) {
         throw std::out_of_range("truncated VOP2 DPP instruction");
@@ -1510,6 +1541,7 @@ void decodeVop2Dpp(std::uint32_t programCounter, std::span<const std::uint32_t> 
     } else {
         throw std::invalid_argument(form == 250u ? "DPP modifier is not supported for opcode" : "DPP8 modifier is not supported for opcode");
     }
+    if (selectsDppSource1(instruction.op)) moveDppSelection(instruction.source0, instruction.source1);
     const bool packedFmac = instruction.op == RdnaOpcode::VPkFmacF16;
     if (packedFmac) {
         instruction.source0.negateHi = instruction.source0.negate;
