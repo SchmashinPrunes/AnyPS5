@@ -5,6 +5,8 @@
 #include <array>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -150,12 +152,30 @@ void check(const State& state, const Codegen::CountOperands& operands, std::uint
     for (const auto value : state.RedZone) require(value == LoweringExecution::kSentinel, std::string(name) + " overwrote the caller's red zone");
 }
 
-void run(const Execution& execution, const Codegen::CountOperands& operands, State state, std::uint64_t memoryValue) {
+bool hostHasExtension(const Codegen::CountOperands& operands) {
+    if (operands.Operation == CountOperation::LeadingZeros) return __builtin_cpu_supports("lzcnt") != 0;
+    return __builtin_cpu_supports("bmi") != 0;
+}
+
+std::unique_ptr<Execution> native(const Bytes& site, const Codegen::CountOperands& operands, std::uint64_t memoryValue) {
+    if (!hostHasExtension(operands)) return nullptr;
+    return LoweringExecution::NativeExecution(site, memoryValue, operands.Memory && operands.Memory->RipRelative);
+}
+
+void run(const Execution& execution, const Execution* reference, const Codegen::CountOperands& operands, State state, std::uint64_t memoryValue, const LoweringExecution::Prepare& prepare = {}) {
     for (const auto flags : {LoweringExecution::kBaseFlags | LoweringExecution::kFlagMask, LoweringExecution::kBaseFlags}) {
         state.InputFlags = flags;
         auto trial = state;
+        if (prepare) prepare(trial, execution.Memory());
         execution.Run(trial);
-        check(trial, operands, operands.Memory ? memoryValue : trial.Input[operands.Source]);
+        const auto source = operands.Memory ? memoryValue : trial.Input[operands.Source];
+        check(trial, operands, source);
+        if (!reference || (!operands.Memory && operands.Source == 4)) continue;
+        auto hardware = state;
+        if (prepare) prepare(hardware, reference->Memory());
+        reference->Run(hardware);
+        const auto difference = LoweringExecution::DifferenceFromNative(trial, hardware, {operands.Destination}, LoweringExecution::kCarry | LoweringExecution::kZero);
+        require(difference.empty(), std::string(Codegen::CountName(operands.Operation)) + " " + std::to_string(operands.Width) + " dst " + std::to_string(operands.Destination) + " (source " + std::to_string(source) + "): " + difference);
     }
 }
 
@@ -169,11 +189,12 @@ void execution() {
                     const auto site = instruction(operation, width, dst, src);
                     const auto operands = *Codegen::DecodeCount(site.data(), site.size());
                     const auto execution = executable(site, 0);
+                    const auto reference = native(site, operands, 0);
                     for (const auto value : values) {
                         if (dst == 4 && value != 0x8000000000000000ull) continue;
                         auto state = LoweringExecution::InitialState();
                         state.Input[src] = value;
-                        run(execution, operands, state, 0);
+                        run(execution, reference.get(), operands, state, 0);
                     }
                 }
             }
@@ -186,13 +207,52 @@ void execution() {
                     const auto site = memorySite(operation, width, tail);
                     const auto operands = *Codegen::DecodeCount(site.data(), site.size());
                     const auto execution = executable(site, value);
+                    const auto reference = native(site, operands, value);
                     auto state = LoweringExecution::InitialState();
-                    state.Input[6] = reinterpret_cast<std::uint64_t>(execution.Memory()) - (tail[0] == 0x46 ? 16 : 0);
-                    state.Input[2] = reinterpret_cast<std::uint64_t>(execution.Memory()) - 3 * 8;
                     state.Input[1] = 3;
-                    state.Input[5] = reinterpret_cast<std::uint64_t>(execution.Memory()) - 16;
                     state.Output[0] = value;
-                    run(execution, operands, state, value);
+                    run(execution, reference.get(), operands, state, value, [&](State& placed, const void* memory) {
+                        placed.Input[6] = reinterpret_cast<std::uint64_t>(memory) - (tail[0] == 0x46 ? 16 : 0);
+                        placed.Input[2] = reinterpret_cast<std::uint64_t>(memory) - 3 * 8;
+                        placed.Input[5] = reinterpret_cast<std::uint64_t>(memory) - 16;
+                    });
+                }
+            }
+        }
+    }
+}
+
+std::uint64_t edgeBiased(std::mt19937_64& random) {
+    const auto bits = random();
+    switch (random() % 6) {
+    case 0: return bits;
+    case 1: return std::uint64_t{1} << (bits % 64);
+    case 2: return (std::uint64_t{1} << (bits % 64)) - 1;
+    case 3: return bits & 0xFFFFFFFFull;
+    case 4: return bits << (random() % 64);
+    default: return bits >> (random() % 64);
+    }
+}
+
+void nativeSweep() {
+    std::mt19937_64 random(20261121);
+    for (const auto operation : kOperations) {
+        const auto probe = instruction(operation, 32, 0, 6);
+        if (!hostHasExtension(*Codegen::DecodeCount(probe.data(), probe.size()))) {
+            std::cout << "the host lacks " << (operation == CountOperation::LeadingZeros ? "LZCNT" : "BMI1") << ": " << Codegen::CountName(operation) << " was checked against the model only\n";
+            continue;
+        }
+        for (const auto width : kWidths) {
+            for (const auto registers : std::array<std::array<std::uint8_t, 2>, 3>{{{0, 6}, {9, 9}, {15, 3}}}) {
+                const auto site = instruction(operation, width, registers[0], registers[1]);
+                const auto operands = *Codegen::DecodeCount(site.data(), site.size());
+                const auto execution = executable(site, 0);
+                const auto reference = native(site, operands, 0);
+                for (unsigned round = 0; round < 10000; ++round) {
+                    auto state = LoweringExecution::InitialState();
+                    state.Input[registers[1]] = edgeBiased(random);
+                    if (registers[0] != registers[1]) state.Input[registers[0]] = random();
+                    run(execution, reference.get(), operands, state, 0);
                 }
             }
         }
@@ -200,6 +260,7 @@ void execution() {
 }
 
 #else
+void nativeSweep() {}
 
 void execution() { std::cout << "count execution checks require a Linux/macOS x86-64 build\n"; }
 
@@ -212,6 +273,7 @@ int main() {
         decoding();
         matching();
         execution();
+        nativeSweep();
         std::cout << "count lowering checks passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
