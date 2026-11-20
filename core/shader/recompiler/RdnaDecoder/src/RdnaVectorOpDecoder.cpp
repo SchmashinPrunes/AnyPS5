@@ -2026,7 +2026,45 @@ bool readsVop2Accumulator(RdnaOpcode opcode) {
     return opcode == RdnaOpcode::VMacF32 || opcode == RdnaOpcode::VMacLegacyF32 || opcode == RdnaOpcode::VFmacF16;
 }
 
+bool ignoresVop3Clamp(RdnaOpcode opcode) {
+    switch (opcode) {
+        case RdnaOpcode::VCvtFlrI32F32:
+        case RdnaOpcode::VCvtRpiI32F32:
+        case RdnaOpcode::VCvtI32F64:
+        case RdnaOpcode::VCvtU32F64:
+        case RdnaOpcode::VCvtI16F16:
+        case RdnaOpcode::VFrexpExpI32F32:
+        case RdnaOpcode::VFrexpExpI32F64:
+        case RdnaOpcode::VFrexpExpI16F16:
+        case RdnaOpcode::VCvtPknormI16F16:
+        case RdnaOpcode::VCvtPknormU16F16:
+        case RdnaOpcode::VCvtPknormI16F32:
+        case RdnaOpcode::VCvtPknormU16F32:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ignoresVop3OutputMultiplier(RdnaOpcode opcode) {
+    switch (opcode) {
+        case RdnaOpcode::VCvtI32F32:
+        case RdnaOpcode::VCvtU32F32:
+        case RdnaOpcode::VCvtI32F64:
+        case RdnaOpcode::VCvtU32F64:
+        case RdnaOpcode::VCvtI16F16:
+        case RdnaOpcode::VCvtU16F16:
+        case RdnaOpcode::VFrexpExpI32F64:
+        case RdnaOpcode::VFrexpExpI16F16:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void checkNativeVop3Modifiers(RdnaOpcode opcode, std::uint32_t encodedOpcode, bool permlane, bool carryInOut, bool scalarDst, std::uint32_t abs, std::uint32_t opSel, std::uint32_t clamp, std::uint32_t omod, std::uint32_t neg) {
+    if (ignoresVop3Clamp(opcode)) clamp = 0u;
+    if (ignoresVop3OutputMultiplier(opcode)) omod = 0u;
     if (permlane) {
         if (abs != 0u || (opSel & ~0x3u) != 0u || clamp != 0u || omod != 0u || neg != 0u) {
             throw std::invalid_argument("VOP3 perm-lane op_sel bits are not implemented");
@@ -2101,10 +2139,9 @@ void checkNativeVop3Modifiers(RdnaOpcode opcode, std::uint32_t encodedOpcode, bo
     const bool sourceModifiers = supportsNativeVop3SourceModifiers(opcode);
     const bool resultModifiers = supportsNativeVop3ResultModifiers(opcode);
     const bool clampModifier = supportsNativeVop3Clamp(opcode);
-    const bool ignoresOutputModifiers = opcode == RdnaOpcode::VCvtI16F16;
     if (sourceModifiers) {
         const bool unmeasuredAccumulatorModifiers = ((abs | neg) & 0x4u) != 0u && readsVop2Accumulator(opcode) && encodedOpcode != 0x12bu && encodedOpcode != 0x136u;
-        if (opSel != 0u || (omod != 0u && !resultModifiers && !ignoresOutputModifiers) || (clamp != 0u && !clampModifier && !ignoresOutputModifiers) || unmeasuredAccumulatorModifiers) {
+        if (opSel != 0u || (omod != 0u && !resultModifiers) || (clamp != 0u && !clampModifier) || unmeasuredAccumulatorModifiers) {
             throw std::invalid_argument("VOP3 source modifiers are not implemented");
         }
         return;
