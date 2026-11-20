@@ -7,7 +7,9 @@
 #include <cstring>
 #include <functional>
 #include <initializer_list>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 #if (defined(__linux__) || defined(__APPLE__)) && defined(__x86_64__)
 #include <csetjmp>
@@ -316,6 +318,33 @@ private:
         append32(displacement);
     }
 };
+
+using Prepare = std::function<void(State& state, const void* memory)>;
+using Before = std::function<void(Codegen::StubBodyBuilder& body)>;
+
+inline std::unique_ptr<Execution> NativeExecution(const Bytes& site, std::uint64_t memoryValue, bool ripRelative, const Before& before = {}, std::size_t trailing = 0) {
+    if (ripRelative && before) throw std::logic_error("a RIP-relative site runs natively only at the start of its body");
+    return std::make_unique<Execution>(site, memoryValue, ripRelative, [&](Codegen::StubBodyBuilder& body, const Bytes& relocated) {
+        if (before) before(body);
+        body.Raw(relocated);
+    }, trailing);
+}
+
+inline State RunNative(const Bytes& site, std::uint64_t memoryValue, bool ripRelative, State state, const Prepare& prepare = {}, const Before& before = {}) {
+    const auto native = NativeExecution(site, memoryValue, ripRelative, before);
+    if (prepare) prepare(state, native->Memory());
+    native->Run(state);
+    return state;
+}
+
+inline std::string DifferenceFromNative(const State& lowered, const State& native, std::initializer_list<std::uint8_t> registers, std::uint64_t flagMask) {
+    for (const auto reg : registers)
+        if (lowered.Output[reg] != native.Output[reg])
+            return "register " + std::to_string(reg) + " is " + std::to_string(lowered.Output[reg]) + ", the native instruction gives " + std::to_string(native.Output[reg]);
+    if (((lowered.Flags ^ native.Flags) & flagMask) != 0)
+        return "flags are " + std::to_string(lowered.Flags & flagMask) + ", the native instruction gives " + std::to_string(native.Flags & flagMask);
+    return {};
+}
 
 #endif
 
