@@ -6,6 +6,8 @@
 #include <array>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -179,14 +181,31 @@ void check(const State& state, const Codegen::ShiftOperands& operands, std::uint
     for (const auto value : state.RedZone) require(value == LoweringExecution::kSentinel, std::string(name) + " overwrote the caller's red zone");
 }
 
-void run(const Execution& execution, const Codegen::ShiftOperands& operands, State state, std::uint64_t memoryValue, bool preserveFlags) {
+bool hostHasBmi2() {
+    return __builtin_cpu_supports("bmi2") != 0;
+}
+
+std::unique_ptr<Execution> native(const Bytes& site, const Codegen::ShiftOperands& operands, std::uint64_t memoryValue, const LoweringExecution::Before& before = {}) {
+    if (!hostHasBmi2()) return nullptr;
+    const auto trailing = operands.Operation == ShiftOperation::RotateRight ? std::size_t{1} : std::size_t{0};
+    return LoweringExecution::NativeExecution(site, memoryValue, operands.Memory && operands.Memory->RipRelative, before, trailing);
+}
+
+void run(const Execution& execution, const Execution* reference, const Codegen::ShiftOperands& operands, State state, std::uint64_t memoryValue, bool preserveFlags, const LoweringExecution::Prepare& prepare = {}) {
     for (const auto flags : {LoweringExecution::kBaseFlags | LoweringExecution::kFlagMask, LoweringExecution::kBaseFlags}) {
         state.InputFlags = flags;
         auto trial = state;
+        if (prepare) prepare(trial, execution.Memory());
         execution.Run(trial);
         const auto source = operands.Memory ? memoryValue : trial.Input[operands.Source];
         const auto count = operands.Operation == ShiftOperation::RotateRight ? operands.Count : trial.Input[operands.Count];
         check(trial, operands, source, count, preserveFlags);
+        if (!reference || (!operands.Memory && operands.Source == 4) || (operands.Operation != ShiftOperation::RotateRight && operands.Count == 4)) continue;
+        auto hardware = state;
+        if (prepare) prepare(hardware, reference->Memory());
+        reference->Run(hardware);
+        const auto difference = LoweringExecution::DifferenceFromNative(trial, hardware, {operands.Destination}, preserveFlags ? 0x8D5u : 0u);
+        require(difference.empty(), std::string(Codegen::ShiftName(operands.Operation)) + (operands.Wide ? " 64" : " 32") + " dst " + std::to_string(operands.Destination) + " (source " + std::to_string(source) + ", count " + std::to_string(count) + "): " + difference);
     }
 }
 
@@ -200,12 +219,13 @@ void execution(const bool preserveFlags) {
                     const auto site = shift(operation, wide, dst, pair.first, pair.second);
                     const auto operands = *Codegen::DecodeShift(site.data(), site.size());
                     const auto execution = executable(site, 0, preserveFlags);
+                    const auto reference = native(site, operands, 0);
                     for (const auto value : values) {
                         for (const auto count : counts) {
                             auto state = LoweringExecution::InitialState();
                             state.Input[pair.first] = value;
                             state.Input[pair.second] = count;
-                            run(execution, operands, state, 0, preserveFlags);
+                            run(execution, reference.get(), operands, state, 0, preserveFlags);
                         }
                     }
                 }
@@ -222,10 +242,11 @@ void execution(const bool preserveFlags) {
                     const auto site = rotate(wide, dst, src, immediate);
                     const auto operands = *Codegen::DecodeShift(site.data(), site.size());
                     const auto execution = executable(site, 0, preserveFlags);
+                    const auto reference = native(site, operands, 0);
                     for (const auto value : values) {
                         auto state = LoweringExecution::InitialState();
                         state.Input[src] = value;
-                        run(execution, operands, state, 0, preserveFlags);
+                        run(execution, reference.get(), operands, state, 0, preserveFlags);
                     }
                 }
             }
@@ -238,13 +259,15 @@ void execution(const bool preserveFlags) {
                     const auto site = memorySite(operation, wide, tail, 13);
                     const auto operands = *Codegen::DecodeShift(site.data(), site.size());
                     const auto execution = executable(site, value, preserveFlags);
+                    const auto reference = native(site, operands, value);
                     auto state = LoweringExecution::InitialState();
-                    state.Input[6] = reinterpret_cast<std::uint64_t>(execution.Memory()) - (tail[0] == 0x46 ? 16 : 0);
-                    state.Input[2] = reinterpret_cast<std::uint64_t>(execution.Memory()) - 3 * 8;
                     state.Input[1] = 3;
-                    state.Input[5] = reinterpret_cast<std::uint64_t>(execution.Memory()) - 16;
                     state.Output[0] = value;
-                    run(execution, operands, state, value, preserveFlags);
+                    run(execution, reference.get(), operands, state, value, preserveFlags, [&](State& placed, const void* memory) {
+                        placed.Input[6] = reinterpret_cast<std::uint64_t>(memory) - (tail[0] == 0x46 ? 16 : 0);
+                        placed.Input[2] = reinterpret_cast<std::uint64_t>(memory) - 3 * 8;
+                        placed.Input[5] = reinterpret_cast<std::uint64_t>(memory) - 16;
+                    });
                 }
             }
             for (const std::uint8_t dst : std::array<std::uint8_t, 2>{0, 4}) {
@@ -255,7 +278,7 @@ void execution(const bool preserveFlags) {
                     constexpr std::uint64_t value = 0xFEDCBA9876543210ull;
                     const auto site = memorySite(operation, wide, tail, 13);
                     const auto operands = *Codegen::DecodeShift(site.data(), site.size());
-                    const Execution execution(site, value, false, [&](Codegen::StubBodyBuilder& body, const Bytes&) {
+                    const auto fill = [&](Codegen::StubBodyBuilder& body) {
                         for (int part = 0; part < 2; ++part) {
                             Bytes store{0xC7, 0x84, 0x24};
                             const auto slot = static_cast<std::uint32_t>(displacement + part * 4);
@@ -264,11 +287,16 @@ void execution(const bool preserveFlags) {
                             for (unsigned s = 0; s < 32; s += 8) store.push_back(static_cast<std::uint8_t>(word >> s));
                             body.Raw(store);
                         }
+                    };
+                    const auto trailing = operands.Operation == ShiftOperation::RotateRight ? std::size_t{1} : std::size_t{0};
+                    const Execution execution(site, value, false, [&](Codegen::StubBodyBuilder& body, const Bytes&) {
+                        fill(body);
                         Codegen::EmitShift(body, operands, preserveFlags);
-                    }, operands.Operation == ShiftOperation::RotateRight ? 1 : 0);
+                    }, trailing);
+                    const auto reference = native(site, operands, value, fill);
                     auto state = LoweringExecution::InitialState();
                     state.Input[1] = 13;
-                    run(execution, operands, state, value, preserveFlags);
+                    run(execution, reference.get(), operands, state, value, preserveFlags);
                 }
             }
             const auto stackSite = operation == ShiftOperation::RotateRight ? rotate(wide, 4, 6, 13) : shift(operation, wide, 4, 6, 2);
@@ -292,12 +320,61 @@ void execution(const bool preserveFlags) {
                 });
                 auto state = LoweringExecution::InitialState();
                 state.Input[2] = 13;
-                run(execution, stackOperands, state, 0, preserveFlags);
+                run(execution, nullptr, stackOperands, state, 0, preserveFlags);
+            }
+        }
+    }
+}
+std::uint64_t edgeBiased(std::mt19937_64& random) {
+    const auto bits = random();
+    switch (random() % 6) {
+    case 0: return bits;
+    case 1: return std::uint64_t{1} << (bits % 64);
+    case 2: return (std::uint64_t{1} << (bits % 64)) - 1;
+    case 3: return bits & 0xFFFFFFFFull;
+    case 4: return bits << (random() % 64);
+    default: return bits >> (random() % 64);
+    }
+}
+
+void nativeSweep() {
+    if (!hostHasBmi2()) {
+        std::cout << "the host has no BMI2: the shift lowering was checked against the model only\n";
+        return;
+    }
+    std::mt19937_64 random(20261121);
+    for (const bool preserveFlags : {true, false}) {
+        for (bool wide : {false, true}) {
+            for (const auto operation : kShifts) {
+                for (const auto registers : std::array<std::array<std::uint8_t, 3>, 3>{{{0, 6, 2}, {9, 9, 1}, {15, 3, 3}}}) {
+                    const auto site = shift(operation, wide, registers[0], registers[1], registers[2]);
+                    const auto operands = *Codegen::DecodeShift(site.data(), site.size());
+                    const auto execution = executable(site, 0, preserveFlags);
+                    const auto reference = native(site, operands, 0);
+                    for (unsigned round = 0; round < 5000; ++round) {
+                        auto state = LoweringExecution::InitialState();
+                        state.Input[registers[1]] = edgeBiased(random);
+                        if (registers[2] != registers[1]) state.Input[registers[2]] = round % 2 == 0 ? random() % 80 : random();
+                        run(execution, reference.get(), operands, state, 0, preserveFlags);
+                    }
+                }
+            }
+            for (const auto immediate : std::array<std::uint8_t, 6>{0, 1, 7, 31, 33, 200}) {
+                const auto site = rotate(wide, 5, 12, immediate);
+                const auto operands = *Codegen::DecodeShift(site.data(), site.size());
+                const auto execution = executable(site, 0, preserveFlags);
+                const auto reference = native(site, operands, 0);
+                for (unsigned round = 0; round < 5000; ++round) {
+                    auto state = LoweringExecution::InitialState();
+                    state.Input[12] = edgeBiased(random);
+                    run(execution, reference.get(), operands, state, 0, preserveFlags);
+                }
             }
         }
     }
 }
 #else
+void nativeSweep() {}
 void execution(bool) { std::cout << "shift execution checks require an x86-64 Linux, macOS or Windows build\n"; }
 #endif
 
@@ -310,6 +387,7 @@ int main() {
         matching();
         execution(true);
         execution(false);
+        nativeSweep();
         std::cout << "shift lowering checks passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
